@@ -1,18 +1,21 @@
 """
-把每日推荐论文写进 Zotero 收藏夹的入口脚本（自带进度提示版）。
+把每日推荐论文写进 Zotero 收藏夹的入口脚本（抗限流加固版）。
 
 放置位置：src/zotero_arxiv_daily/main_zotero.py（与 main.py 同级）
-粘贴要求：必须从第一行一直到最后一行的「文件到此结束」都贴上
 
-作用：完整复用原有的抓取 / 排序 / 写邮件逻辑，只在发邮件之前，
-      把推荐出来的论文额外写一份到你在 Zotero 里指定的收藏夹。
+它在原项目基础上多做了两件事：
+  1. 把「从 arXiv 抓论文详情」这一步换成更耐用的版本：
+     被 arXiv 限流时长时间重试；实在拿不到就跳过那一小批、继续往下走，
+     绝不让整个任务崩掉（原版遇到 503 会直接报错退出，一封邮件都发不出）。
+  2. 在发邮件之前，把推荐出来的论文额外写一份到指定的 Zotero 收藏夹。
 """
 
 # 这行会最先输出。如果日志里连它都没有，说明文件内容不完整。
-print("[ZOTERO-SYNC] 1/5 脚本开始运行", flush=True)
+print("[ZOTERO-SYNC] 1/6 脚本开始运行", flush=True)
 
 import os
 import sys
+import random
 import logging
 import traceback
 
@@ -29,8 +32,181 @@ dotenv.load_dotenv()
 import zotero_arxiv_daily.executor as executor_module
 from zotero_arxiv_daily.executor import Executor
 
-print("[ZOTERO-SYNC] 2/5 依赖加载完成", flush=True)
+try:
+    from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever
+except Exception as _import_exc:  # 万一路径变了也不至于整个任务起不来
+    ArxivRetriever = None
+    print(f"[ZOTERO-SYNC] 提示：未能加载 arXiv 抓取模块（{_import_exc}），将沿用原版逻辑", flush=True)
 
+print("[ZOTERO-SYNC] 2/6 依赖加载完成", flush=True)
+
+
+def _say(message):
+    """同时打到控制台和日志里，方便在 GitHub 日志里搜 ZOTERO-SYNC。"""
+    print(f"[ZOTERO-SYNC] {message}", flush=True)
+    logger.info(message)
+
+
+def _env_int(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# ============ 抗限流：替换 arXiv 抓取逻辑 ============
+
+BATCH_SIZE = 50               # 一次向 arXiv 索取多少篇的详细信息（原版是 20）
+MAX_TRIES = 6                 # 同一批最多尝试几次
+INTER_BATCH_SLEEP = 5         # 每批之间歇多久（秒）
+MAX_CONSECUTIVE_FAILURES = 5  # 连续这么多批都拿不到，就认定被临时封禁，收工
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+MAX_RETRIEVAL_MINUTES = 90    # 抓取阶段的硬性时间预算，超了就带着已有成果往下走
+
+
+def _status_of(exc):
+    status = getattr(exc, "status", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hardened_retrieve_raw_papers(self):
+    """替换原版的 ArxivRetriever._retrieve_raw_papers。
+
+    与原版的区别：
+      * 一次要 50 篇而不是 20 篇，请求次数减少约 60%
+      * 429 / 5xx 都会重试，退避时间更长（原版只认 429，遇到 503 直接崩）
+      * 某一批最终拿不到时「跳过」而不是「抛错」，保证邮件仍能发出
+      * 连续多批被拒时及时收手，不再硬撞 arXiv
+    """
+    import arxiv
+    import feedparser
+    from time import sleep
+    from tqdm import tqdm
+
+    query = '+'.join(self.config.source.arxiv.category)
+    include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+
+    _say(f"读取 arXiv 每日列表（分类：{query}）")
+    feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+    feed_title = getattr(feed.feed, "title", "") or ""
+    if "Feed error for query" in feed_title:
+        raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+
+    allowed = {"new", "cross"} if include_cross_list else {"new"}
+    all_ids = [
+        entry.id.removeprefix("oai:arXiv.org:")
+        for entry in feed.entries
+        if entry.get("arxiv_announce_type", "new") in allowed
+    ]
+    if self.config.executor.debug:
+        all_ids = all_ids[:10]
+
+    total_found = len(all_ids)
+    if total_found == 0:
+        _say("arXiv 今天没有新论文（周末和节假日通常如此）")
+        return []
+    _say(f"arXiv 今日新增 {total_found} 篇候选论文")
+
+    # 可选：限制候选池大小。arXiv 对云服务器的 IP 限流很凶，
+    # 候选越少、请求越少，被拦住的概率越低。
+    cap = _env_int("ARXIV_MAX_CANDIDATES", 200)
+    if cap and len(all_ids) > cap:
+        all_ids = random.sample(all_ids, cap)
+        _say(
+            f"为降低被限流的概率，从 {total_found} 篇中随机抽取 {cap} 篇进入候选池"
+            f"（想调整可改环境变量 ARXIV_MAX_CANDIDATES，设为 0 表示不限制）"
+        )
+
+    total = len(all_ids)
+    batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    _say(f"开始逐批获取论文详情，共 {batches} 批")
+
+    client = arxiv.Client(num_retries=1, delay_seconds=3)
+    raw_papers = []
+    bar = tqdm(total=total)
+    consecutive_failures = 0
+    failed_batches = 0
+
+    from time import monotonic
+    budget_seconds = max(_env_int("ARXIV_MAX_MINUTES", MAX_RETRIEVAL_MINUTES), 1) * 60
+    started_at = monotonic()
+
+    for batch_no, start in enumerate(range(0, total, BATCH_SIZE), 1):
+        if monotonic() - started_at > budget_seconds:
+            _say(
+                f"抓取已耗时超过 {budget_seconds // 60} 分钟，为避免整个任务超时被强制中断，"
+                f"就此结束抓取、带着已拿到的 {len(raw_papers)} 篇继续往下走"
+            )
+            break
+        ids = all_ids[start:start + BATCH_SIZE]
+        search = arxiv.Search(id_list=ids)
+        got = False
+        for attempt in range(MAX_TRIES):
+            try:
+                batch = list(client.results(search))
+                bar.update(len(batch))
+                raw_papers.extend(batch)
+                got = True
+                break
+            except Exception as exc:
+                status = _status_of(exc)
+                detail = type(exc).__name__ + ("" if status is None else f" {status}")
+                retryable = status is None or status in RETRYABLE_STATUS
+                if retryable and attempt < MAX_TRIES - 1:
+                    wait = min(30 * (attempt + 1), 180)
+                    _say(
+                        f"第 {batch_no}/{batches} 批被 arXiv 限流（{detail}），"
+                        f"{wait} 秒后重试（第 {attempt + 2}/{MAX_TRIES} 次）"
+                    )
+                    sleep(wait)
+                else:
+                    _say(
+                        f"第 {batch_no}/{batches} 批最终失败（{detail}），"
+                        f"跳过这 {len(ids)} 篇，继续后面的批次"
+                    )
+                    break
+
+        if got:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            failed_batches += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                _say(
+                    f"arXiv 连续 {consecutive_failures} 批全部被拒，判定为临时封禁，"
+                    f"提前结束本次抓取（不再硬撞，以免封禁时间变长）"
+                )
+                break
+
+        if start + BATCH_SIZE < total:
+            sleep(INTER_BATCH_SLEEP)
+
+    bar.close()
+
+    if failed_batches:
+        _say(f"本次有 {failed_batches} 批因限流被跳过，最终拿到 {len(raw_papers)} 篇候选论文")
+    else:
+        _say(f"arXiv 论文抓取完成，共 {len(raw_papers)} 篇")
+    return raw_papers
+
+
+# 装载补丁：原版这个方法遇到 503 会直接抛错让整个任务失败
+if ArxivRetriever is not None:
+    ArxivRetriever._retrieve_raw_papers = _hardened_retrieve_raw_papers
+    print("[ZOTERO-SYNC] 3/6 抗限流补丁已装载", flush=True)
+else:
+    print("[ZOTERO-SYNC] 3/6 抗限流补丁未装载（沿用原版逻辑）", flush=True)
+
+
+# ============ 写回 Zotero ============
 
 def _creators(authors):
     """把 ["Yann LeCun", "John Smith"] 转成 Zotero 的作者格式。"""
@@ -56,12 +232,6 @@ def _archive_id(url):
     if "arxiv.org/abs/" in url:
         return "arXiv:" + url.split("/abs/", 1)[1].strip("/")
     return ""
-
-
-def _say(message):
-    """同时打到控制台和日志里，方便在 GitHub 日志里搜 ZOTERO-SYNC。"""
-    print(f"[ZOTERO-SYNC] {message}", flush=True)
-    logger.info(message)
 
 
 def _to_item(paper, collection):
@@ -199,14 +369,14 @@ def main(config: DictConfig):
 
     executor_module.render_email = render_email_and_sync
 
-    print("[ZOTERO-SYNC] 4/5 开始抓取与排序（这一步最慢，属正常）", flush=True)
+    print("[ZOTERO-SYNC] 5/6 开始抓取与排序（这一步最慢，属正常）", flush=True)
     Executor(config).run()
-    print("[ZOTERO-SYNC] 5/5 主流程结束", flush=True)
+    print("[ZOTERO-SYNC] 6/6 主流程结束", flush=True)
 
 
 # ↓↓↓ 文件必须以此结尾，缺了它 Python 会什么都不做、也不报错 ↓↓↓
 if __name__ == "__main__":
-    print("[ZOTERO-SYNC] 3/5 即将调用主流程（看到这行说明文件结尾是完整的）", flush=True)
+    print("[ZOTERO-SYNC] 4/6 即将调用主流程（看到这行说明文件结尾是完整的）", flush=True)
     try:
         main()
     except Exception:
