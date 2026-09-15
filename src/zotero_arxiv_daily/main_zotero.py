@@ -9,7 +9,7 @@
 """
 
 # 这行会最先输出。如果日志里连它都没有，说明文件内容不完整。
-print("[ZOTERO-SYNC] 1/4 脚本开始运行", flush=True)
+print("[ZOTERO-SYNC] 1/5 脚本开始运行", flush=True)
 
 import os
 import sys
@@ -29,7 +29,7 @@ dotenv.load_dotenv()
 import zotero_arxiv_daily.executor as executor_module
 from zotero_arxiv_daily.executor import Executor
 
-print("[ZOTERO-SYNC] 2/4 依赖加载完成", flush=True)
+print("[ZOTERO-SYNC] 2/5 依赖加载完成", flush=True)
 
 
 def _creators(authors):
@@ -199,17 +199,18 @@ def main(config: DictConfig):
 
     executor_module.render_email = render_email_and_sync
 
-    print("[ZOTERO-SYNC] 3/4 开始抓取与排序（这一步最慢，属正常）", flush=True)
+    print("[ZOTERO-SYNC] 4/5 开始抓取与排序（这一步最慢，属正常）", flush=True)
     Executor(config).run()
-    print("[ZOTERO-SYNC] 4/4 主流程结束", flush=True)
+    print("[ZOTERO-SYNC] 5/5 主流程结束", flush=True)
 
 
 # ↓↓↓ 文件必须以此结尾，缺了它 Python 会什么都不做、也不报错 ↓↓↓
-if __name__ == "__&#8203;main__":
+if __name__ == "__main__":
+    print("[ZOTERO-SYNC] 3/5 即将调用主流程（看到这行说明文件结尾是完整的）", flush=True)
     try:
         main()
     except Exception:
         print("[ZOTERO-SYNC] 主流程异常退出，错误信息如下：", flush=True)
         traceback.print_exc()
         sys.exit(1)
-# ==== 文件到此结束。能看到这一行，说明粘贴是完整的 ====
+# ==== 文件到此结束。能看到这一行，说明内容一直到结尾都在 ====
